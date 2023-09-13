@@ -20,6 +20,12 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+import flash_attn
+if flash_attn.__version__ >= "2.0":
+  from flash_attn import flash_attn_func
+else:
+  from flash_attn.flash_attn_interface import flash_attn_func
+
 from ...activations import ACT2FN
 from ...modeling_outputs import (
     BaseModelOutputWithPast,
@@ -160,6 +166,7 @@ class OPTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        flash_attention: bool = True
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
 
@@ -169,8 +176,6 @@ class OPTAttention(nn.Module):
 
         bsz, tgt_len, _ = hidden_states.size()
 
-        # get query proj
-        query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
         if is_cross_attention and past_key_value is not None:
             # reuse k,v, cross_attentions
@@ -201,6 +206,26 @@ class OPTAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_states, value_states)
 
+        if flash_attention:
+          query_states = self.q_proj(hidden_states)
+          key_states = key_states.transpose(1, 2)
+          value_states = value_states.transpose(1, 2)
+          if flash_attn.__version__ >= "2.0":
+            query_states = query_states.view(bsz, tgt_len, self.num_heads, self.head_dim)
+            attn_output = flash_attn_func(query_states, key_states, value_states, self.dropout, self.scaling, True)
+          else:
+            query_states = query_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
+            key_states = key_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
+            value_states = value_states.view(bsz * tgt_len, self.num_heads, self.head_dim)
+            qkv = torch.stack([query_states, key_states, value_states], dim=1)
+            cu_seqlens = torch.arange(0, (bsz + 1) * tgt_len, tgt_len, dtype=torch.int32, device=query_states.device)
+            attn_output = flash_attn_func(qkv, cu_seqlens, self.dropout, tgt_len, self.scaling, True, False)
+          attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+          attn_output = self.out_proj(attn_output)
+          return attn_output, None, past_key_value
+
+        # get query proj
+        query_states = self.q_proj(hidden_states) * self.scaling
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
         key_states = key_states.view(*proj_shape)
